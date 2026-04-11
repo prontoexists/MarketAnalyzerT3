@@ -1,4 +1,6 @@
 import os
+import json
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -6,6 +8,7 @@ import plotly.graph_objects as go
 from streamlit_folium import st_folium
 import folium
 import streamlit.components.v1 as components
+from services.model_logic import load_model, predict
 
 st.set_page_config(
     page_title="Mollecul | AI Real Estate Intelligence",
@@ -127,6 +130,133 @@ def get_top_listings(df, city):
         top_df["investment_score"] = top_df["investment_score"].round(2)
 
     return top_df
+
+
+@st.cache_resource
+def get_valuation_model():
+    model_path = os.path.join(BASE_DIR, "services", "VER4_property_valuation_model.joblib")
+    return load_model(model_path)
+
+
+def map_dashboard_row_to_model_input(row: pd.Series) -> pd.DataFrame:
+    """
+    Map the dashboard CSV row into the ATTOM-style schema expected by
+    services/model_logic.py. Missing fields are allowed.
+    """
+    beds_val = row.get("BEDS", np.nan)
+    price_val = row.get("PRICE", np.nan)
+
+    mapped = {
+        "lat": row.get("LATITUDE", np.nan),
+        "lng": row.get("LONGITUDE", np.nan),
+        "beds": beds_val,
+        "bathsFull": row.get("BATHS", np.nan),
+        "bathsTotal": row.get("BATHS", np.nan),
+        "bathsHalf": np.nan,
+        "sqft": row.get("SQUARE FEET", np.nan),
+        "lotSqft": row.get("LOT SIZE", np.nan),
+        "yearBuilt": row.get("YEAR BUILT", np.nan),
+        "salePrice": price_val,
+        "pricePerSqft": row.get("PRICE_PER_SQFT_FINAL", np.nan),
+        "pricePerBed": (
+            price_val / beds_val
+            if pd.notna(price_val) and pd.notna(beds_val) and beds_val not in [0, 0.0]
+            else np.nan
+        ),
+        "city": row.get("CITY", None),
+        "propertyType": row.get("PROPERTY TYPE", None),
+        "zip": row.get("ZIP OR POSTAL CODE", None),
+        "saleType": row.get("SALE TYPE", None),
+        "address": row.get("ADDRESS", None),
+    }
+
+    return pd.DataFrame([mapped])
+
+
+@st.cache_resource
+def get_forecast_artifacts():
+    model_path = os.path.join(BASE_DIR, "services", "VER4_round2_forecast_model.joblib")
+    scaler_path = os.path.join(BASE_DIR, "services", "VER4_round2_scaler.joblib")
+    feature_cols_path = os.path.join(BASE_DIR, "services", "VER4_round2_feature_cols.json")
+
+    model = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    with open(feature_cols_path, "r", encoding="utf-8") as f:
+        feature_cols = json.load(f)
+
+    return model, scaler, feature_cols
+
+
+def build_forecast_input(overrides: dict | None = None) -> pd.DataFrame:
+    """
+    Build a single-row dataframe for the forecast model.
+    Uses stable baseline defaults so the UI can preview the model safely
+    without requiring a live macroeconomic feed.
+    """
+    current_month = int(pd.Timestamp.today().month)
+    defaults = {
+        "mortgage_rate_30yr": 6.75,
+        "fed_funds_rate": 5.25,
+        "housing_starts_south": 800.0,
+        "existing_home_sales": 4.10,
+        "new_home_sales": 0.70,
+        "yield_spread": 0.25,
+        "treasury_10yr": 4.25,
+        "treasury_2yr": 4.00,
+        "case_shiller_dallas": 330.0,
+        "cs_dallas_mom_pct": 0.40,
+        "cs_dallas_3mo_pct": 1.20,
+        "cpi_shelter": 3.50,
+        "unemployment_texas": 4.10,
+        "labor_force_part_texas": 64.0,
+        "wage_growth_texas": 4.00,
+        "sp500_return": 0.50,
+        "homebuilder_etf_return": 0.40,
+        "reit_index_return": 0.20,
+        "vix": 18.0,
+        "oil_wti": 75.0,
+        "txn_stock_return": 0.20,
+        "att_stock_return": 0.10,
+        "treasury_etf_return": -0.10,
+        "mortgage_rate_30yr_lag1": 6.75,
+        "fed_funds_rate_lag1": 5.25,
+        "sp500_return_lag1": 0.50,
+        "cs_dallas_mom_pct_lag1": 0.40,
+        "vix_lag1": 18.0,
+        "homebuilder_etf_return_lag1": 0.40,
+        "month": current_month,
+        "quarter": ((current_month - 1) // 3) + 1,
+        "is_spring": 1 if current_month in [3, 4, 5] else 0,
+        "is_summer": 1 if current_month in [6, 7, 8] else 0,
+    }
+
+    if overrides:
+        defaults.update(overrides)
+
+    month_val = int(defaults.get("month", current_month))
+    defaults["quarter"] = ((month_val - 1) // 3) + 1
+    defaults["is_spring"] = 1 if month_val in [3, 4, 5] else 0
+    defaults["is_summer"] = 1 if month_val in [6, 7, 8] else 0
+
+    defaults["yield_spread"] = float(defaults.get("treasury_10yr", 0.0)) - float(defaults.get("treasury_2yr", 0.0))
+    defaults["mortgage_rate_30yr_lag1"] = float(defaults.get("mortgage_rate_30yr", 0.0))
+    defaults["fed_funds_rate_lag1"] = float(defaults.get("fed_funds_rate", 0.0))
+    defaults["sp500_return_lag1"] = float(defaults.get("sp500_return", 0.0))
+    defaults["cs_dallas_mom_pct_lag1"] = float(defaults.get("cs_dallas_mom_pct", 0.0))
+    defaults["vix_lag1"] = float(defaults.get("vix", 0.0))
+    defaults["homebuilder_etf_return_lag1"] = float(defaults.get("homebuilder_etf_return", 0.0))
+
+    _, _, feature_cols = get_forecast_artifacts()
+    row = {col: defaults.get(col, 0.0) for col in feature_cols}
+    return pd.DataFrame([row])
+
+
+def forecast_predict(input_df: pd.DataFrame) -> float:
+    model, scaler, feature_cols = get_forecast_artifacts()
+    X = input_df[feature_cols]
+    X_scaled = scaler.transform(X)
+    pred = model.predict(X_scaled)
+    return float(pred[0])
 
 if not os.path.exists(csv_path):
     st.error(f"CSV not found at: {csv_path}")
@@ -1039,6 +1169,25 @@ with c1:
 
 city_df = df[df["CITY"].str.lower() == target_city.lower()].copy()
 
+valuation_model = get_valuation_model()
+
+predicted_value = np.nan
+selected_listing_address = "N/A"
+selected_listing_price = np.nan
+
+if not city_df.empty:
+    try:
+        preview_idx = city_df["investment_score"].idxmax()
+        preview_row = city_df.loc[preview_idx]
+
+        selected_listing_address = preview_row.get("ADDRESS", "N/A")
+        selected_listing_price = preview_row.get("PRICE", np.nan)
+
+        model_input_df = map_dashboard_row_to_model_input(preview_row)
+        predicted_value = float(predict(valuation_model, model_input_df)[0])
+    except Exception:
+        predicted_value = np.nan
+
 avg_price   = city_df["PRICE"].mean()           if "PRICE"               in city_df.columns else np.nan
 avg_ppsqft  = city_df["PRICE_PER_SQFT_FINAL"].mean() if "PRICE_PER_SQFT_FINAL" in city_df.columns else np.nan
 avg_dom     = city_df["DAYS ON MARKET"].mean()  if "DAYS ON MARKET"      in city_df.columns else np.nan
@@ -1049,6 +1198,9 @@ avg_price_fmt  = f"${avg_price:,.0f}"   if pd.notna(avg_price)  else "N/A"
 avg_ppsqft_fmt = f"${avg_ppsqft:,.0f}" if pd.notna(avg_ppsqft) else "N/A"
 avg_dom_fmt    = f"{avg_dom:.1f} days"  if pd.notna(avg_dom)    else "N/A"
 listing_fmt    = f"{listing_count:,}"
+predicted_value_fmt = f"${predicted_value:,.0f}" if pd.notna(predicted_value) else "N/A"
+model_gap = predicted_value - selected_listing_price if pd.notna(predicted_value) and pd.notna(selected_listing_price) else np.nan
+model_gap_fmt = f"${model_gap:,.0f}" if pd.notna(model_gap) else "N/A"
 
 st.markdown(f"""
 <div class="metric-grid">
@@ -1076,6 +1228,13 @@ st.markdown(f"""
     <div class="metric-card-value">{listing_fmt}</div>
     <div class="metric-card-sub">properties in dataset</div>
   </div>
+
+  <div class="metric-card" style="--accent-bar: linear-gradient(90deg,#b89eff,#2ce4df)">
+    <span class="metric-card-icon">🧠</span>
+    <div class="metric-card-label">Model Estimate</div>
+    <div class="metric-card-value">{predicted_value_fmt}</div>
+    <div class="metric-card-sub">Top-ranked listing preview · gap {model_gap_fmt}</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1085,6 +1244,103 @@ with _cols[0]: st.metric("Average Price", avg_price_fmt)
 with _cols[1]: st.metric("Avg $ / Sq Ft", avg_ppsqft_fmt)
 with _cols[2]: st.metric("Avg Days on Market", avg_dom_fmt)
 with _cols[3]: st.metric("Listings", listing_fmt)
+
+# ── Forecast preview ───────────────────────────────────────────────────────────
+st.markdown("""
+<div class='dash-section'>
+  <div class='dash-section-bar'></div>
+  <div>
+    <div class='dash-section-label'>Forecasting</div>
+    <div class='dash-section-title'>Forecast Model Preview</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+st.markdown("### Forecast Assumptions")
+
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+with col1:
+    mortgage_rate_30yr = st.slider("Mortgage Rate (30yr %)", 3.0, 10.0, 6.75)
+
+with col2:
+    fed_funds_rate = st.slider("Fed Funds Rate %", 0.0, 10.0, 5.25)
+
+with col3:
+    treasury_10yr = st.slider("10Y Treasury %", 0.0, 10.0, 4.25)
+
+with col4:
+    treasury_2yr = st.slider("2Y Treasury %", 0.0, 10.0, 4.00)
+
+with col5:
+    case_shiller_dallas = st.slider("Case-Shiller Index", 100.0, 500.0, 320.0)
+
+with col6:
+    vix = st.slider("VIX", 10.0, 50.0, 18.0)
+
+forecast_output = np.nan
+forecast_ready = False
+forecast_error = ""
+
+implied_spread = treasury_10yr - treasury_2yr
+forecast_ready = False
+forecast_output = np.nan
+forecast_error = ""
+
+try:
+    forecast_input_df = build_forecast_input({
+        "mortgage_rate_30yr": mortgage_rate_30yr,
+        "fed_funds_rate": fed_funds_rate,
+        "treasury_10yr": treasury_10yr,
+        "treasury_2yr": treasury_2yr,
+        "case_shiller_dallas": case_shiller_dallas,
+        "vix": vix
+    })
+
+    forecast_output = forecast_predict(forecast_input_df)
+    forecast_ready = True
+
+except Exception as e:
+    forecast_error = str(e)
+    forecast_ready = False
+if forecast_ready:
+    forecast_output_fmt = f"{forecast_output:,.4f}" if pd.notna(forecast_output) else "N/A"
+    implied_spread = treasury_10yr - treasury_2yr
+    if forecast_ready:
+        st.success(f"Forecast output: {forecast_output:,.4f}")
+    else:
+        st.warning(f"Forecast model not ready: {forecast_error or 'Unknown error'}")
+    st.markdown(f"""
+    <div class="metric-grid">
+      <div class="metric-card" style="--accent-bar: linear-gradient(90deg,#2ce4df,#5ea6ff)">
+        <span class="metric-card-icon">📈</span>
+        <div class="metric-card-label">Forecast Output</div>
+        <div class="metric-card-value">{forecast_output_fmt}</div>
+        <div class="metric-card-sub">Model output based on current macro assumptions</div>
+      </div>
+      <div class="metric-card" style="--accent-bar: linear-gradient(90deg,#5ea6ff,#b89eff)">
+        <span class="metric-card-icon">🏦</span>
+        <div class="metric-card-label">Mortgage Rate</div>
+        <div class="metric-card-value">{mortgage_rate_30yr:.2f}%</div>
+        <div class="metric-card-sub">30-year baseline assumption</div>
+      </div>
+      <div class="metric-card" style="--accent-bar: linear-gradient(90deg,#e7c65a,#ff9f7a)">
+        <span class="metric-card-icon">📊</span>
+        <div class="metric-card-label">Case-Shiller Dallas</div>
+        <div class="metric-card-value">{case_shiller_dallas:,.1f}</div>
+        <div class="metric-card-sub">Home-price index input</div>
+      </div>
+      <div class="metric-card" style="--accent-bar: linear-gradient(90deg,#b89eff,#2ce4df)">
+        <span class="metric-card-icon">🧮</span>
+        <div class="metric-card-label">Yield Spread</div>
+        <div class="metric-card-value">{implied_spread:.2f}</div>
+        <div class="metric-card-sub">10Y minus 2Y treasury rate</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.caption("Forecast model uses the saved forecast .joblib, scaler, and feature-cols JSON. The displayed value is the raw model output for the chosen assumptions.")
+else:
+    st.info(f"Forecast model preview is unavailable right now: {forecast_error}")
 
 # ── Charts ─────────────────────────────────────────────────────────────────────
 st.markdown("""
