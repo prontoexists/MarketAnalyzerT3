@@ -49,3 +49,4 @@ wheels/
 # Environment variables
 .env
 .env.local
+data/PART1_NEW_Dallas_Properties.csv
